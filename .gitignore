@@ -1,0 +1,25 @@
+# environments, caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# secrets — never commit (.env.example is the template)
+.env
+.env.*
+!.env.example
+
+# data, ledgers, model weights (large; exchange data is not ours to redistribute)
+store/
+runs/
+data/
+
+# third-party code: GPL/AGPL archives and Kronos (fetch with scripts/fetch_kronos.sh)
+vendor/
+
+# personal / private
+.claude/
+share/
+ARCHIVED_ON_DRIVE.txt
+scripts/archive_*.sh

@@ -1,0 +1,109 @@
+# 刷钱机 1.0 实验配置。回测和模拟盘共用这一份，保证两边的策略、成本、风控完全一致。
+#   mm data sync --config configs/v1.toml          # 下载/更新行情和资金费
+#   mm backtest  --config configs/v1.toml          # 历史回放（不调 LLM）
+#   mm paper     --config configs/v1.toml          # 实时模拟盘（长期运行，可断点续跑）
+#   mm report    --config configs/v1.toml          # 最近一次运行的报告
+
+[run]
+name = "v1"
+db = "runs/v1.sqlite"
+start = "2024-01-01"        # 回测起点（模拟盘忽略）
+# end = "2026-07-01"        # 回测终点，留空 = 数据最新
+warmup_bars = 300           # 每个策略能看到的最近 K 线根数（策略周期）
+seed = 42
+benchmark = "S0_hold_btc"
+
+[market]
+symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
+strategy_timeframe = "1H"
+matching_timeframe = "1m"            # 模拟盘：用 1 分钟 K 线撮合
+backtest_matching_timeframe = "5m"   # 回测：本地有 5 分钟历史
+store_dir = "store/okx"
+archive_dir = "data/OKX_K线数据"
+
+[costs]                     # OKX 普通用户永续费率
+maker_fee = 0.0002
+taker_fee = 0.0005
+slippage_bps = 2.0          # 市价单/止损单每边额外 2bp
+default_funding_rate = 0.0001   # 只在没有真实资金费数据时使用
+default_funding_interval_h = 8
+
+[account]                   # 每个策略一个独立虚拟钱包
+initial_usdt = 10000
+max_leverage = 3.0
+risk_per_trade = 0.01       # 打到止损亏 1% 净值
+daily_loss_limit = 0.05     # 当日亏 5% 后当天不再开新仓
+max_open_positions = 3
+maintenance_margin_rate = 0.005
+
+[gonogo]                    # 上真钱的放行标准（事先定死）
+min_forward_days = 56
+min_trades = 100
+max_drawdown = 0.15
+
+# ── 策略分组 ───────────────────────────────────────────────────────────────
+# S0 对照组
+[[strategy]]
+id = "S0_hold_btc"
+kind = "buy_and_hold"
+symbols = ["BTC-USDT-SWAP"]
+params = { notional_frac = 1.0 }
+
+[[strategy]]
+id = "S0_random"
+kind = "random_entry"
+params = { p_enter = 0.02, sl_atr = 2.0, tp_atr = 3.0, max_hold_bars = 48 }
+
+# S1 规则策略（确定性，可回测）
+[[strategy]]
+id = "S1_ema"
+kind = "ema_trend"
+params = { fast = 20, slow = 100, sl_atr = 3.0, allow_short = true }
+
+[[strategy]]
+id = "S1_donchian"
+kind = "donchian"
+params = { entry_n = 55, exit_n = 20, sl_atr = 2.0, allow_short = true }
+
+# S2 = S1_ema + LLM 否决（LLM 只能删单/减仓）。需要 .env 里配置中转站后再启用。
+[[strategy]]
+id = "S2_ema_veto"
+kind = "llm_veto"
+enabled = false
+params = { base = "ema_trend", base_params = { fast = 20, slow = 100, sl_atr = 3.0, allow_short = true }, model = "claude-opus-5-5", lookback = 48 }
+
+# S3 纯 LLM 决策。每根 1H K 线每个币调用一次（3 个币 ≈ 72 次/天）。
+[[strategy]]
+id = "S3_llm"
+kind = "llm_direct"
+enabled = false
+params = { model = "claude-opus-5-5", lookback = 48, min_confidence = 60 }
+
+# ── LLM 中转站 ──────────────────────────────────────────────────────────────
+[llm]
+timeout_s = 180
+strict_model = true         # 中转返回的模型和请求的不一致 → 视为失败、不交易
+max_calls_per_day = 200     # 每个策略每天的调用上限
+max_tokens_per_day = 3000000
+
+# 价格 = 官方标价（美元/百万 token），用来按"全价"核算 LLM 成本。
+[[llm.models]]
+name = "claude-opus-5-5"
+protocol = "anthropic"      # 走官方 Anthropic SDK（中转需支持 /v1/messages）
+effort = "medium"
+price_in = 4.0
+price_out = 20.0
+
+[[llm.models]]
+name = "claude-sonnet-5-5"
+protocol = "anthropic"
+effort = "medium"
+price_in = 2.0
+price_out = 10.0
+
+# 其他模型走 OpenAI 兼容接口。名字要和中转站里的一致，价格请按官方价填写。
+# [[llm.models]]
+# name = "deepseek-chat"
+# protocol = "openai"
+# price_in = 0.0
+# price_out = 0.0

@@ -1,0 +1,93 @@
+# 刷钱机 2.0：机器学习横截面组合的模拟盘配置。
+#   mm ml data                      # 下载/更新 2.0 数据（store/ml）
+#   mm ml research                  # 预先登记的滚动验证 + 门槛 A 报告
+#   mm ml train --name v2_lgbm ...  # 训练生产模型（考试前只用 2026-04-01 之前的数据）
+#   mm paper --config configs/v2.toml   # 用训练好的模型跑实时模拟盘
+
+[run]
+name = "v2"
+db = "runs/v2.sqlite"
+warmup_bars = 5
+seed = 42
+benchmark = "S0_hold_btc"
+
+[market]
+symbols = ["BTC-USDT-SWAP"]
+symbols_file = "store/ml/candidates.txt"   # 全部可能进入币池的币（mm ml data 生成）
+strategy_timeframe = "1D"                   # 每天 00:00 UTC 决策一次
+matching_timeframe = "1m"
+store_dir = "store/okx"
+
+[costs]
+maker_fee = 0.0002
+taker_fee = 0.0005
+slippage_bps = 2.0
+default_funding_rate = 0.0001
+default_funding_interval_h = 8
+
+[account]
+initial_usdt = 100000
+max_leverage = 2.0
+risk_per_trade = 0.01
+daily_loss_limit = 0.05
+max_open_positions = 60
+maintenance_margin_rate = 0.005
+
+[gonogo]
+# 2026-10-15 修改（经用户同意，在任何前向结果出来之前）：ML_v2 是对冲掉大盘的策略，
+# 和"买入持有 BTC"比主要取决于这段时间 BTC 的涨跌，不能说明策略好坏。
+# 所以改为：跑赢随机对照组（同一段时间）+ 扣除全部成本后净收益为正；BTC 只作参考。
+# 组合型策略很少把仓位完全平掉，"交易笔数"按实际成交笔数统计。
+min_forward_days = 56
+min_trades = 100
+max_drawdown = 0.15
+beat_benchmark = false
+require_positive_net = true
+
+[[strategy]]
+id = "S0_hold_btc"
+kind = "buy_and_hold"
+symbols = ["BTC-USDT-SWAP"]
+params = { notional_frac = 1.0 }
+
+[[strategy]]
+id = "ML_v2"
+kind = "ml_portfolio"
+params = { artifact = "v2_main", sync = true, control = "P0_placebo" }
+
+# 随机对照组：和 ML_v2 用同一个币池、同一个优化器、同样的成本和参数，只把信号换成随机数。
+# 随机信号的日间持续性和模型信号一致（见 src/moneymachine/ml/placebo.py），换手和成本可比。
+[[strategy]]
+id = "P0_placebo"
+kind = "ml_placebo"
+params = { artifact = "v2_main", sync = true, seed = 20261015 }
+
+
+# ── v3 探索组（2026-10-15 加入，经用户同意）──────────────────────────────
+# 这两组在开发数据上没有通过门槛 A（见 research/2026-10-15_刷钱机v3_结果.md），只作前向检验：
+# 从加入那天起单独计时 56 天，和自己的随机对照组在同一段时间比较。
+# 三个用模型的账户（ML_v2、A1a、B1b）每天共用同一份模型信号；三个随机对照组用同一个种子。
+# control = 判定时只和这一个随机对照组比较（构建方法相同）。
+
+# A1a：v2 信号按币种做指数平滑（半衰期 2 天，离开币池 5 天以上重新开始），再交给 v2 的优化器。
+[[strategy]]
+id = "A1a_smoothed"
+kind = "ml_smoothed"
+params = { artifact = "v2_main", sync = true, half_life = 2, gap_reset = 5, control = "P2_placebo_smoothed" }
+
+[[strategy]]
+id = "P2_placebo_smoothed"
+kind = "ml_placebo_smoothed"
+params = { artifact = "v2_main", sync = true, seed = 20261015, half_life = 2, gap_reset = 5 }
+
+# B1b：小资金集中版，1000 USDT。多空各 8 个币，进入前 8 才建仓、跌出前 16 才平仓，
+# 每个新仓 0.5×净值/8，按最小下单量取整；持仓不做日常再平衡；用 BTC 对冲贝塔。
+[[strategy]]
+id = "B1b_concentrated"
+kind = "ml_concentrated"
+params = { artifact = "v2_main", sync = true, n = 8, buffer = 16, initial_usdt = 1000, control = "P1_placebo_concentrated" }
+
+[[strategy]]
+id = "P1_placebo_concentrated"
+kind = "ml_placebo_concentrated"
+params = { artifact = "v2_main", sync = true, seed = 20261015, n = 8, buffer = 16, initial_usdt = 1000 }

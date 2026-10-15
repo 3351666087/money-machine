@@ -189,17 +189,31 @@ def signal(px: pd.DataFrame) -> pd.DataFrame:
     return s.where(lp.shift(max(LOOKBACKS)).notna())
 
 
+def target_weights(px: pd.DataFrame, n: int, long_only: bool, universe: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Target weight per day and coin, before the trading band (shared by backtest and live)."""
+    lr = np.log(px)
+    vol = (lr - lr.shift(1)).rolling(60, min_periods=40).std() * np.sqrt(365)
+    tgt = signal(px) * np.minimum(1.0, VOL_TARGET / vol) / n
+    if universe is not None:
+        tgt = tgt.where(universe)
+    tgt = tgt.fillna(0.0)
+    return tgt.clip(lower=0.0) if long_only else tgt
+
+
+def apply_band(target: pd.Series, current: pd.Series) -> pd.Series:
+    """Trade a coin only if its sign changes or it is > BAND (relative) away from the target."""
+    current = current.reindex(target.index).fillna(0.0)
+    flip = np.sign(target) != np.sign(current)
+    big = (target - current).abs() > BAND * np.maximum(target.abs(), current.abs())
+    return current.where(~(flip | big), target)
+
+
 def backtest(inp: dict, *, long_only: bool, start: int, end: int = END, costs: CostModel | None = None,
              funding: bool = True) -> dict:
     costs = costs or CostModel()
     px, uni, n = inp["px"], inp["universe"], inp["n"]
     days = px.index[(px.index >= start) & (px.index < end)]
-    lr = np.log(px)
-    vol = (lr - lr.shift(1)).rolling(60, min_periods=40).std() * np.sqrt(365)
-    sig = signal(px)
-    tgt = (sig * np.minimum(1.0, VOL_TARGET / vol) / n).where(uni).fillna(0.0)
-    if long_only:
-        tgt = tgt.clip(lower=0.0)
+    tgt = target_weights(px, n, long_only, uni)
     r_fwd = (px.shift(-1) / px - 1).fillna(0.0)
     fund = inp["fund"].reindex(index=px.index, columns=px.columns).fillna(0.0) if funding else px * 0.0
     no_fund = inp["fund"].reindex(index=px.index, columns=px.columns).isna()
@@ -207,10 +221,7 @@ def backtest(inp: dict, *, long_only: bool, start: int, end: int = END, costs: C
     w = pd.Series(0.0, index=px.columns)
     rows, missing_fund = [], 0
     for t in days:
-        target = tgt.loc[t]
-        flip = np.sign(target) != np.sign(w)
-        big = (target - w).abs() > BAND * np.maximum(target.abs(), w.abs())
-        new = w.where(~(flip | big), target)
+        new = apply_band(tgt.loc[t], w)
         trade = (new - w).abs()
         cost = float((trade * (FEE + hs.loc[t].fillna(costs.hs_max) + SLIP)).sum()) * costs.multiplier
         r, f = r_fwd.loc[t], fund.loc[t]
@@ -329,3 +340,29 @@ def json_years(row) -> dict:
     if m is not None:
         return m["by_year"]
     return {int(c.split(".")[-1]): row[c] for c in row.index if str(c).startswith("by_year.") and pd.notna(row[c])}
+
+
+# ── live (paper account T1b_trend) ───────────────────────────────────────
+def live_targets(insts: list[str], t: int, current: dict[str, float], *, long_only: bool = True,
+                 sync: bool = True) -> tuple[dict[str, float] | None, dict]:
+    """Today's targets from OKX perp daily closes (the traded instruments; the backtest on OKX
+    data matches the Binance-based one, see the v5 report). Same functions as the backtest."""
+    if sync:
+        from moneymachine.market.okx_rest import OkxRest
+
+        rest = OkxRest()
+        for i in insts:
+            D.sync_candles(rest, i, "1Dutc", "bars_1D")
+    px = _wide("bars_1D", insts, "close", D.ROOT, DAY).sort_index()
+    if t not in px.index or px.loc[t].isna().any():
+        return None, {"reason": f"daily close for decision time {t} not available yet"}
+    hist = px.loc[:t]
+    tgt = target_weights(hist, len(insts), long_only).loc[t]
+    new = apply_band(tgt, pd.Series(current, dtype=float))
+    lp = np.log(hist)
+    info = {"signal": {i: float(signal(hist)[i].iloc[-1]) for i in insts},
+            "vol60": {i: float((lp[i] - lp[i].shift(1)).rolling(60, min_periods=40).std().iloc[-1] * np.sqrt(365))
+                      for i in insts},
+            "target": {i: float(tgt[i]) for i in insts}, "gross": float(new.abs().sum()),
+            "turnover": float((new - pd.Series(current, dtype=float).reindex(new.index).fillna(0.0)).abs().sum())}
+    return {i: float(new[i]) for i in insts}, info

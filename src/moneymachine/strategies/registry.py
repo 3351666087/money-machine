@@ -7,10 +7,11 @@ from moneymachine.strategies.ml_portfolio import (
     MLConcentrated, MLPlacebo, MLPlaceboConcentrated, MLPlaceboSmoothed, MLPortfolio, MLSmoothed,
 )
 from moneymachine.strategies.rules import BuyAndHold, DonchianBreakout, EmaTrend, RandomEntry
+from moneymachine.strategies.trend import TrendTSMOM
 
 KINDS: dict[str, type[Strategy]] = {
     cls.kind: cls for cls in (BuyAndHold, RandomEntry, EmaTrend, DonchianBreakout, LLMDirect, LLMVeto, MLPortfolio, MLPlacebo,
-                MLSmoothed, MLPlaceboSmoothed, MLConcentrated, MLPlaceboConcentrated)
+                MLSmoothed, MLPlaceboSmoothed, MLConcentrated, MLPlaceboConcentrated, TrendTSMOM)
 }
 
 

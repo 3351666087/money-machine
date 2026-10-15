@@ -91,3 +91,14 @@ params = { artifact = "v2_main", sync = true, n = 8, buffer = 16, initial_usdt =
 id = "P1_placebo_concentrated"
 kind = "ml_placebo_concentrated"
 params = { artifact = "v2_main", sync = true, seed = 20261015, n = 8, buffer = 16, initial_usdt = 1000 }
+
+# ── v5 趋势跟踪（2026-10-15 加入；研究试验 T1b 通过了预先登记的全部 6 条标准）────────
+# BTC + ETH：过去 20/60/120 天涨跌方向的平均 × min(1, 40%/60 天波动率) ÷ 2，只做多或空仓，
+# 偏离目标 25% 以上或方向改变才调仓；不加杠杆。用 OKX 永续的日线收盘价。
+# 交易很少：56 天看不出表现，这个账户主要验证"实盘执行和回测规则一致"，表现至少看 6 个月。
+# control = "none"：没有随机对照组，判定时不比较。
+[[strategy]]
+id = "T1b_trend"
+kind = "trend_tsmom"
+symbols = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+params = { long_only = true, sync = true, initial_usdt = 1000, control = "none" }

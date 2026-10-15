@@ -37,9 +37,10 @@ DAY = 86_400_000
 RESEND_AFTER_S = 6 * 3600
 NAMES = {"ML_v2": "机器学习策略", "S0_hold_btc": "买入持有BTC", "P0_placebo": "随机对照组",
          "A1a_smoothed": "探索组·信号平滑", "P2_placebo_smoothed": "随机对照·平滑",
-         "B1b_concentrated": "探索组·小资金集中", "P1_placebo_concentrated": "随机对照·小资金集中"}
+         "B1b_concentrated": "探索组·小资金集中", "P1_placebo_concentrated": "随机对照·小资金集中",
+         "T1b_trend": "趋势跟踪 BTC+ETH"}
 PORTFOLIO_IDS = ("ML_v2", "P0_placebo", "A1a_smoothed", "P2_placebo_smoothed", "B1b_concentrated",
-                 "P1_placebo_concentrated")
+                 "P1_placebo_concentrated", "T1b_trend")
 
 
 @dataclass(frozen=True)

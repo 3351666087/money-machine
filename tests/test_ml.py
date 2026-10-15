@@ -344,3 +344,38 @@ def test_minute_executor_fill_rules():
     ex = MinuteExecutor("M30", px, {(inst, t): dip}, {inst: 0.01}, costs, through=3)   # stricter: 3 ticks
     w, c = ex(t, [inst], np.array([0.0]), np.array([0.1]), np.array([1e9]), np.array([0.0]), 1e5)
     assert ex.stats["fallback"] == 1
+
+
+def test_trend_live_targets_match_backtest_rule(tmp_path, monkeypatch):
+    from moneymachine.ml import data as Dmod, trend as TR
+
+    monkeypatch.setattr(Dmod, "ROOT", tmp_path)
+    rng = np.random.default_rng(4)
+    insts = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+    n = 400
+    for k, inst in enumerate(insts):
+        c = 100 * (k + 1) * np.exp(np.cumsum(rng.normal(0.001, 0.03, n)))
+        (tmp_path / "bars_1D").mkdir(exist_ok=True)
+        pd.DataFrame({"time": T0 + np.arange(n) * DAY, "open": c, "high": c, "low": c, "close": c,
+                      "vol_ccy": 1.0, "vol_quote": 1e9}).to_parquet(tmp_path / "bars_1D" / f"{inst}.parquet")
+    px = pd.DataFrame({i: pd.read_parquet(tmp_path / "bars_1D" / f"{i}.parquet").set_index("time")["close"]
+                       for i in insts})
+    px.index = px.index + DAY
+    full = TR.target_weights(px, 2, long_only=True)
+    for t in px.index[150::37]:
+        got, info = TR.live_targets(insts, int(t), {}, long_only=True, sync=False)   # sees data up to t only
+        assert got == pytest.approx(full.loc[t].to_dict())
+        assert all(v >= 0 for v in got.values()) and sum(got.values()) <= 1.0 + 1e-12
+    got, info = TR.live_targets(insts, int(px.index[-1] + DAY), {}, sync=False)
+    assert got is None                                                              # tomorrow's close not there
+
+
+def test_trend_band():
+    from moneymachine.ml.trend import apply_band
+
+    tgt = pd.Series({"A": 0.40, "B": 0.0, "C": 0.30})
+    cur = pd.Series({"A": 0.35, "B": 0.20, "C": 0.10})
+    out = apply_band(tgt, cur)
+    assert out["A"] == 0.35      # 12.5% away: hold
+    assert out["B"] == 0.0       # signal went flat: exit
+    assert out["C"] == 0.30      # 67% away: trade to target

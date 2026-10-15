@@ -14,7 +14,7 @@ from moneymachine.timeutil import fmt_ms
 PLACEBO_KINDS = ("random_entry", "ml_placebo", "ml_placebo_smoothed", "ml_placebo_concentrated")
 BASELINE_KINDS = ("buy_and_hold",) + PLACEBO_KINDS
 PORTFOLIO_KINDS = ("ml_portfolio", "ml_placebo", "ml_smoothed", "ml_placebo_smoothed", "ml_concentrated",
-                   "ml_placebo_concentrated")
+                   "ml_placebo_concentrated", "trend_tsmom")
 
 
 def list_runs(db_path: str | Path) -> pd.DataFrame:
@@ -154,6 +154,8 @@ def gonogo(summary: pd.DataFrame, benchmark: str, crit: GoNoGo, mode: str,
             checks["net_positive"] = bool(r["net_after_llm"] > r["end_equity"] / (1 + r["total_return"]))
         beats = []
         mine_placebos = placebo[placebo["strategy"] == r["control"]] if r.get("control") else placebo
+        if r.get("control") == "none":
+            mine_placebos = placebo.iloc[0:0]
         for _, p in mine_placebos.iterrows():
             if daily is not None and r["strategy"] in daily and p["strategy"] in daily:
                 common = max(daily[r["strategy"]].first_valid_index(), daily[p["strategy"]].first_valid_index())
@@ -161,7 +163,8 @@ def gonogo(summary: pd.DataFrame, benchmark: str, crit: GoNoGo, mode: str,
                 beats.append(bool(mine > theirs) if not (math.isnan(mine) or math.isnan(theirs)) else False)
             else:
                 beats.append(bool(r["net_after_llm"] > p["net_after_llm"]))
-        checks["beats_placebo"] = bool(beats) and all(beats)
+        if r.get("control") != "none":   # control = "none": no placebo arm (e.g. the trend account)
+            checks["beats_placebo"] = bool(beats) and all(beats)
         checks["max_dd"] = bool(r["max_dd"] <= crit.max_drawdown)
         row = {"strategy": r["strategy"], **checks, "PASS": all(checks.values())}
         if not crit.beat_benchmark and not math.isnan(bench_net):

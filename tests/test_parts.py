@@ -388,3 +388,69 @@ def test_execlab_shadow_fill_rule(tmp_path, monkeypatch):
     lab.on_trade("X-USDT-SWAP", 99.98, 4, o["placed"] + 90_000)
     row = lab.db.execute("SELECT filled_min, through_sz, contracts FROM shadow WHERE id=?", (i,)).fetchone()
     assert row == (1.0, 6.0, 0.5)
+
+
+def test_okx_read_only_client():
+    import base64
+    import hashlib
+    import hmac
+
+    import httpx
+    import pytest as _pt
+
+    from moneymachine.okx_private import OkxApiError, ReadOnlyOkx
+
+    sig = ReadOnlyOkx.sign("s3cret", "2020-12-08T09:08:57.715Z", "GET", "/api/v5/account/balance?ccy=BTC")
+    want = base64.b64encode(hmac.new(b"s3cret", b"2020-12-08T09:08:57.715ZGET/api/v5/account/balance?ccy=BTC",
+                                     hashlib.sha256).digest()).decode()
+    assert sig == want
+    perm = {"v": "read_only"}
+    seen = []
+
+    def handler(req: httpx.Request):
+        seen.append((req.method, req.url.path, req.headers.get("OK-ACCESS-PASSPHRASE")))
+        if req.url.path == "/api/v5/account/config":
+            return httpx.Response(200, json={"code": "0", "data": [{"perm": perm["v"], "label": "t", "ip": ""}]})
+        return httpx.Response(200, json={"code": "0", "data": [{"totalEq": "12.5", "details": []}]})
+
+    c = ReadOnlyOkx("KEY-zzz", "SECRET-zzz", "PASS-zzz", http=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert "zzz" not in repr(c) and "zzz" not in str(vars(c).get("http"))
+    assert c.get("/api/v5/account/balance")[0]["totalEq"] == "12.5"
+    assert seen[0][1] == "/api/v5/account/config"                       # permission checked first
+    assert all(m == "GET" for m, _, _ in seen)
+    with _pt.raises(PermissionError):
+        c.get("/api/v5/trade/order")                                    # order endpoint: refused locally
+    perm["v"] = "read_only,trade"
+    c2 = ReadOnlyOkx("k", "s", "p", http=httpx.Client(transport=httpx.MockTransport(handler)))
+    with _pt.raises(OkxApiError, match="read-only"):
+        c2.get("/api/v5/account/balance")                               # trading key: refused
+    with _pt.raises(OkxApiError, match="MM_OKX_PASSPHRASE"):
+        ReadOnlyOkx("k", "s", "")
+
+
+def test_execlab_sees_fills_committed_late_with_the_same_timestamp(tmp_path, monkeypatch):
+    import pandas as pd
+
+    from moneymachine.execlab import ExecLab
+    from moneymachine.ledger import Ledger
+
+    pd.DataFrame({"inst": ["X-USDT-SWAP", "Y-USDT-SWAP"], "tick_sz": [0.01, 0.01], "ct_val": [1.0, 1.0]}).to_parquet(
+        tmp_path / "i.parquet")
+    lg = Ledger(tmp_path / "l.sqlite", "r1")
+    lg.start_run("t", "paper", "")
+    ts = int(__import__("time").time() * 1000)
+    lg.fill("ML_v2", 1, "X-USDT-SWAP", "buy", "rebalance", 1.0, 10.0, 0.0, "taker", 0.0, ts)
+    lg.commit()
+    lab = ExecLab(tmp_path / "l.sqlite", tmp_path / "x.sqlite", tmp_path / "i.parquet")
+    monkeypatch.setattr(lab, "_mid", lambda s: (10.0, 10.01))
+    for f in lab.poll_fills():
+        lab.last_seen = max(lab.last_seen, f[5])
+        lab.place(*f)
+    lg.fill("B1b_concentrated", 2, "Y-USDT-SWAP", "sell", "rebalance", 1.0, 10.0, 0.0, "taker", 0.0, ts)  # same ts,
+    lg.commit()                                                                                            # later commit
+    late = lab.poll_fills()
+    assert [f[0] for f in late] == ["B1b_concentrated"]
+    for f in late:
+        lab.place(*f)
+    assert lab.poll_fills() == []
+    lg.close()

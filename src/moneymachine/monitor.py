@@ -158,7 +158,24 @@ def daily_summary(db_path: Path) -> str:
                                  "ORDER BY ts DESC LIMIT 6", (run_id,)):
         lines.append(f"今日决策 {NAMES.get(s, s)}：{msg}")
     db.close()
+    okx = okx_line()
+    if okx:
+        lines.append(okx)
     return "\n".join(lines)
+
+
+def okx_line() -> str | None:
+    """Real OKX account, read-only (stage 1 of real trading); None when no key is configured."""
+    if not os.environ.get("MM_OKX_API_KEY"):
+        return None
+    try:
+        from moneymachine.okx_private import ReadOnlyOkx
+
+        s = ReadOnlyOkx().snapshot()
+        return (f"OKX 实盘账户（只读）：权益 {s['total_equity_usd']:,.2f} USD，持仓 {len(s['positions'])} 个，"
+                f"挂单 {s['open_orders']} 个，密钥权限 {s['perm']}")
+    except Exception as e:  # noqa: BLE001 — message never contains the credentials
+        return f"OKX 实盘账户（只读）：查询失败 — {type(e).__name__}: {str(e)[:120]}"
 
 
 # ── delivery ─────────────────────────────────────────────────────────────
@@ -221,6 +238,12 @@ def run_once(db_path: Path, state_path: Path, *, collect_dir: Path | None = None
     state = json.loads(state_path.read_text()) if state_path.exists() else {"open": {}, "last_run": now_ms - 600_000}
     alerts = check(db_path, now_ms=now_ms, since_ms=state.get("last_run", now_ms - 600_000),
                    collect_dir=collect_dir, probe=probe)
+    if probe is None and now_ms - state.get("okx_checked", 0) > 3_600_000:   # real account: hourly, read-only
+        state["okx_checked"] = now_ms
+        line = okx_line()
+        state["okx_alert"] = line if line and ("查询失败" in line or "read_only" not in line) else None
+    if state.get("okx_alert"):
+        alerts.append(Alert("okx:api", "warn", state["okx_alert"]))
     current = {a.key: a for a in alerts}
     fresh = [a for a in alerts if a.key not in state["open"] or now_ms / 1000 - state["open"][a.key] > RESEND_AFTER_S]
     recovered = [k for k in state["open"] if k not in current and not k.startswith("event:")]

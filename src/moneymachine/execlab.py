@@ -77,11 +77,18 @@ class ExecLab:
             run = db.execute("SELECT run_id FROM runs WHERE mode='paper' ORDER BY created_at DESC LIMIT 1").fetchone()
             if not run:
                 return []
+            # fills of one minute share a timestamp but reach the ledger in several commits, so look back
+            # 15 minutes and skip the ones already shadowed (fixed 2026-10-16: "ts > last_seen" lost 6 of 33)
             q = (f"SELECT strategy, symbol, side, qty, price, ts FROM fills WHERE run_id=? AND role='rebalance' "
-                 f"AND ts>? AND strategy IN ({','.join('?' * len(ARMS))}) ORDER BY ts")
-            return db.execute(q, (run[0], self.last_seen, *ARMS)).fetchall()
+                 f"AND ts>=? AND strategy IN ({','.join('?' * len(ARMS))}) ORDER BY ts")
+            rows = db.execute(q, (run[0], self.last_seen - 15 * 60_000, *ARMS)).fetchall()
+            return [r for r in rows if not self._known(r[0], r[1], r[5], r[2])]
         finally:
             db.close()
+
+    def _known(self, arm: str, sym: str, ts: int, side: str) -> bool:
+        return self.db.execute("SELECT 1 FROM shadow WHERE arm=? AND symbol=? AND taker_ts=? AND side=?",
+                               (arm, sym, ts, side)).fetchone() is not None
 
     def _mid(self, sym: str) -> tuple[float, float]:
         t = self.rest.get("/api/v5/market/ticker", {"instId": sym})[0]

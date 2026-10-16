@@ -181,6 +181,18 @@ def cmd_ml_collect(args) -> None:
     run(interval_s=args.interval, max_iters=args.iters)
 
 
+def cmd_okx_check(args) -> None:
+    """Read-only OKX account check (stage 1 of real trading): permissions, equity, positions."""
+    from moneymachine.okx_private import ReadOnlyOkx
+
+    load_env_file()
+    snap = ReadOnlyOkx().snapshot()
+    print(f"key label {snap['label']!r} | permission {snap['perm']} | IP whitelist {'set' if snap['ip_bound'] else 'NOT set'}")
+    print(f"account level {snap['account_level']} | position mode {snap['position_mode']}")
+    print(f"total equity {snap['total_equity_usd']:,.2f} USD | non-zero balances {len(snap['balances'])} | "
+          f"positions {len(snap['positions'])} | open orders {snap['open_orders']}")
+
+
 def cmd_execlab(args) -> None:
     """v4 E2: shadow post-only orders for the paper arms' rebalances (observation only)."""
     import asyncio
@@ -251,6 +263,7 @@ def main(argv: list[str] | None = None) -> None:
     mo.add_argument("--test", action="store_true", help="send a test message through the configured channels")
 
     add("execlab", cmd_execlab, "v4: shadow post-only orders next to the paper rebalances (never trades)")
+    add("okx-check", cmd_okx_check, "read-only OKX account check (needs MM_OKX_* in .env; never trades)")
 
     lc = add("llm-check", cmd_llm_check, "test the relay with each configured model")
     lc.add_argument("--model")

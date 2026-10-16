@@ -11,7 +11,7 @@ check() {  # label, extended regex
   if [[ -n ${hits} ]]; then echo "BLOCKED ($1):"; echo "${hits}" | head -5; bad=1; fi
 }
 check "token / key" '(gho_|ghp_|github_pat_|sk-[A-Za-z0-9]{20}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY)' 'sk-xxxx'
-check "filled secret in env syntax" '^(MM_[A-Z_]*(TOKEN|KEY|PASSWORD|WEBHOOK))=[^[:space:]]+' 'example\.com|sk-xxxx'
+check "filled secret in env syntax" '^(MM_[A-Z_]*(TOKEN|KEY|PASSWORD|PASSPHRASE|SECRET|WEBHOOK))=[^[:space:]]+' 'example\.com|sk-xxxx'
 # public IPv4 addresses (private, loopback and documentation ranges are fine)
 ips=$(echo "${files}" | tr '\n' '\0' | xargs -0 grep -HnoIE '(^|[^0-9.])([0-9]{1,3}\.){3}[0-9]{1,3}([^0-9.]|$)' 2>/dev/null \
   | python3 -c '

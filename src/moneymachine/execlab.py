@@ -11,6 +11,11 @@ watches OKX's public trade stream for 240 minutes:
 
 Results: ``runs/execlab.sqlite`` (table ``shadow``), compared with the E1 replay of the same
 orders in the v4 report. Reads the paper ledger read-only; never touches the paper accounts.
+
+A fill noticed more than STALE_MS after it happened (e.g. after a restart) is recorded with
+status ``stale`` and no virtual order: the book has moved on, so it would not be comparable.
+The E2 analysis also drops rows placed more than MAX_DELAY_MS after the fill (6 rows on
+2026-10-16 were placed ~10 h late by a restart, before this rule existed).
 """
 from __future__ import annotations
 
@@ -30,6 +35,8 @@ log = logging.getLogger(__name__)
 WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
 ARMS = ("ML_v2", "A1a_smoothed", "B1b_concentrated")
 WINDOW_MS = 240 * 60_000
+STALE_MS = 15 * 60_000
+MAX_DELAY_MS = 5 * 60_000
 CHECK_MS = 30 * 60_000
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS shadow (
@@ -95,6 +102,12 @@ class ExecLab:
         return float(t["bidPx"]), float(t["askPx"])
 
     def place(self, arm, sym, side, qty, px, ts) -> None:
+        if _now() - ts > STALE_MS:
+            self.db.execute("INSERT OR IGNORE INTO shadow (arm, symbol, side, qty, taker_ts, taker_px, status, note) "
+                            "VALUES (?,?,?,?,?,?, 'stale', 'noticed too late; not shadowed')",
+                            (arm, sym, side, qty, ts, px))
+            self.db.commit()
+            return
         bid, ask = self._mid(sym)
         tick = self.tick.get(sym, 0.0) or bid * 1e-5
         lim = bid if side == "buy" else ask

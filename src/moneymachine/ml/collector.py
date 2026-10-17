@@ -3,7 +3,9 @@
 every ``interval_s`` seconds, two bulk requests cover all USDT perpetuals:
   - /market/tickers  → last, best bid/ask price + size (spread & top-of-book depth), 24h volume
   - /public/open-interest → open interest
-Written to ``store/ml/collect/{YYYY-MM-DD}.parquet`` (one file per UTC day).
+Written to ``store/ml/collect/{YYYY-MM-DD}/{HHMMSS}.parquet`` (one small file per snapshot, so memory
+stays flat; until 2026-10-17 it was one file per day, re-read and rewritten every snapshot, which made
+the process grow towards its memory limit by midnight). ``load_day`` reads either layout.
 Used later to calibrate the cost model and as higher-frequency positioning data.
 """
 from __future__ import annotations
@@ -45,14 +47,23 @@ def snapshot(rest: OkxRest) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def append(df: pd.DataFrame) -> Path:
-    OUT.mkdir(parents=True, exist_ok=True)
-    day = pd.Timestamp(int(df["ts"].iloc[0]), unit="ms").strftime("%Y-%m-%d")
-    p = OUT / f"{day}.parquet"
-    if p.exists():
-        df = pd.concat([pd.read_parquet(p), df], ignore_index=True)
+def append(df: pd.DataFrame, out: Path = OUT) -> Path:
+    t = pd.Timestamp(int(df["ts"].iloc[0]), unit="ms")
+    d = out / t.strftime("%Y-%m-%d")
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{t.strftime('%H%M%S')}.parquet"
     df.to_parquet(p, index=False)
     return p
+
+
+def load_day(day: str, out: Path = OUT) -> pd.DataFrame:
+    """All snapshots of one UTC day (YYYY-MM-DD), from the old single file and/or the new folder."""
+    parts = []
+    if (out / f"{day}.parquet").exists():
+        parts.append(pd.read_parquet(out / f"{day}.parquet"))
+    parts += [pd.read_parquet(f) for f in sorted((out / day).glob("*.parquet"))] if (out / day).is_dir() else []
+    return (pd.concat(parts, ignore_index=True).drop_duplicates(["ts", "inst"]).sort_values(["ts", "inst"])
+            if parts else pd.DataFrame())
 
 
 def run(interval_s: int = 300, max_iters: int | None = None) -> None:

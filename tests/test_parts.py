@@ -454,3 +454,51 @@ def test_execlab_sees_fills_committed_late_with_the_same_timestamp(tmp_path, mon
         lab.place(*f)
     assert lab.poll_fills() == []
     lg.close()
+
+
+def test_collector_part_files_and_memory_alert_hysteresis(tmp_path):
+    import pandas as pd
+
+    from moneymachine.ledger import Ledger
+    from moneymachine.ml.collector import append, load_day
+    from moneymachine.monitor import check
+
+    t0 = 1_792_195_200_000                                   # 2026-10-17 00:00 UTC
+    for k in range(3):
+        append(pd.DataFrame({"ts": [t0 + k * 300_000] * 2, "inst": ["A", "B"], "last": [1.0, 2.0]}), tmp_path)
+    pd.DataFrame({"ts": [t0 - 1], "inst": ["A"], "last": [0.5]}).to_parquet(tmp_path / "2026-10-17.parquet")  # old layout
+    d = load_day("2026-10-17", tmp_path)
+    assert len(d) == 7 and d["ts"].is_monotonic_increasing
+    assert len(list((tmp_path / "2026-10-17").glob("*.parquet"))) == 3
+
+    lg = Ledger(tmp_path / "m.sqlite", "r1")
+    lg.start_run("t", "paper", "")
+    lg.close()
+    mem = {"v": 0.80}
+    probe = {"state": lambda s: "active", "memory": lambda s: (int(mem["v"] * 100), 100), "disk_free": lambda p: 10 * 2**30}
+    keys = lambda open_keys: {a.key for a in check(tmp_path / "m.sqlite", now_ms=t0, since_ms=t0, services=("svc",),  # noqa: E731
+                                                   probe=probe, open_keys=open_keys)}
+    assert "mem:svc" not in keys(())                         # 80%: below the 85% alert line
+    mem["v"] = 0.86
+    assert "mem:svc" in keys(())                             # 86%: alert
+    mem["v"] = 0.80
+    assert "mem:svc" in keys(("mem:svc",))                   # back to 80% while open: still open (no flapping)
+    mem["v"] = 0.70
+    assert "mem:svc" not in keys(("mem:svc",))               # below 75%: recovered
+
+
+def test_execlab_marks_stale_fills(tmp_path, monkeypatch):
+    import pandas as pd
+
+    from moneymachine.execlab import STALE_MS, ExecLab
+    from moneymachine.ledger import Ledger
+
+    pd.DataFrame({"inst": ["X-USDT-SWAP"], "tick_sz": [0.01], "ct_val": [1.0]}).to_parquet(tmp_path / "i.parquet")
+    lg = Ledger(tmp_path / "l.sqlite", "r1")
+    lg.start_run("t", "paper", "")
+    lg.close()
+    lab = ExecLab(tmp_path / "l.sqlite", tmp_path / "x.sqlite", tmp_path / "i.parquet")
+    monkeypatch.setattr(lab, "_mid", lambda s: (_ for _ in ()).throw(AssertionError("must not query the book")))
+    old = int(__import__("time").time() * 1000) - STALE_MS - 60_000
+    lab.place("ML_v2", "X-USDT-SWAP", "buy", 1.0, 10.0, old)
+    assert lab.db.execute("SELECT status FROM shadow").fetchone()[0] == "stale" and not lab.open

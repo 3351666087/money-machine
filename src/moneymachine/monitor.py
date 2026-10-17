@@ -74,8 +74,8 @@ def service_memory(name: str) -> tuple[int, int]:
 def check(db_path: Path, *, now_ms: int, since_ms: int,
           services=("money-machine-paper", "money-machine-collect", "money-machine-execlab"),
           collect_dir: Path | None = None, portfolio_strategies=PORTFOLIO_IDS,
-          lag_min: float = 10, mem_frac: float = 0.85, disk_min_gb: float = 2.0, dd_warn: float = 0.10,
-          probe=None) -> list[Alert]:
+          lag_min: float = 10, mem_frac: float = 0.85, mem_clear: float = 0.75, disk_min_gb: float = 2.0,
+          dd_warn: float = 0.10, probe=None, open_keys=()) -> list[Alert]:
     probe = probe or {"state": service_state, "memory": service_memory,
                       "disk_free": lambda p: shutil.disk_usage(p).free}
     alerts: list[Alert] = []
@@ -84,7 +84,8 @@ def check(db_path: Path, *, now_ms: int, since_ms: int,
         if st != "active":
             alerts.append(Alert(f"svc:{s}", "crit", f"服务 {s} 状态是 {st}"))
         cur, mx = probe["memory"](s)
-        if mx and cur / mx > mem_frac:
+        # hysteresis: raise above mem_frac, clear only below mem_clear (no flapping around the line)
+        if mx and cur / mx > (mem_clear if f"mem:{s}" in open_keys else mem_frac):
             alerts.append(Alert(f"mem:{s}", "warn", f"{s} 内存 {cur / 2**20:.0f}MB，已到上限的 {cur / mx:.0%}"))
     free = probe["disk_free"](str(db_path.parent))
     if free < disk_min_gb * 2**30:
@@ -133,8 +134,8 @@ def check(db_path: Path, *, now_ms: int, since_ms: int,
     db.close()
 
     if collect_dir is not None and collect_dir.exists():
-        files = sorted(collect_dir.glob("*.parquet"))
-        if not files or time.time() - files[-1].stat().st_mtime > 20 * 60:
+        files = list(collect_dir.glob("**/*.parquet"))
+        if not files or time.time() - max(f.stat().st_mtime for f in files) > 20 * 60:
             alerts.append(Alert("collect:stale", "warn", "数据采集超过 20 分钟没有新快照"))
     return alerts
 
@@ -237,7 +238,7 @@ def run_once(db_path: Path, state_path: Path, *, collect_dir: Path | None = None
     now_ms = now_ms or int(time.time() * 1000)
     state = json.loads(state_path.read_text()) if state_path.exists() else {"open": {}, "last_run": now_ms - 600_000}
     alerts = check(db_path, now_ms=now_ms, since_ms=state.get("last_run", now_ms - 600_000),
-                   collect_dir=collect_dir, probe=probe)
+                   collect_dir=collect_dir, probe=probe, open_keys=tuple(state["open"]))
     if probe is None and now_ms - state.get("okx_checked", 0) > 3_600_000:   # real account: hourly, read-only
         state["okx_checked"] = now_ms
         line = okx_line()

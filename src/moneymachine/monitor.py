@@ -63,11 +63,20 @@ def service_state(name: str) -> str:
 
 
 def service_memory(name: str) -> tuple[int, int]:
+    """(memory the process really uses, MemoryMax). systemd's MemoryCurrent also counts the page cache
+    of files the service wrote or read (e.g. 518 of the paper process's 936 MB on 2026-10-21), which the
+    kernel reclaims under pressure, so it over-states the risk; the cgroup's ``anon`` memory does not."""
     out = _systemctl("show", name, "-p", "MemoryCurrent", "-p", "MemoryMax", "--value").split()
     try:
-        return int(out[0]), int(out[1])
+        cur, mx = int(out[0]), int(out[1])
     except (IndexError, ValueError):
         return 0, 0
+    try:
+        stat = Path(f"/sys/fs/cgroup/system.slice/{name}.service/memory.stat").read_text().split("\n")
+        cur = next(int(line.split()[1]) for line in stat if line.startswith("anon "))
+    except (OSError, StopIteration, ValueError, IndexError):
+        pass
+    return cur, mx
 
 
 # ── checks ───────────────────────────────────────────────────────────────
@@ -86,7 +95,7 @@ def check(db_path: Path, *, now_ms: int, since_ms: int,
         cur, mx = probe["memory"](s)
         # hysteresis: raise above mem_frac, clear only below mem_clear (no flapping around the line)
         if mx and cur / mx > (mem_clear if f"mem:{s}" in open_keys else mem_frac):
-            alerts.append(Alert(f"mem:{s}", "warn", f"{s} 内存 {cur / 2**20:.0f}MB，已到上限的 {cur / mx:.0%}"))
+            alerts.append(Alert(f"mem:{s}", "warn", f"{s} 实际内存 {cur / 2**20:.0f}MB（不含文件缓存），已到上限的 {cur / mx:.0%}"))
     free = probe["disk_free"](str(db_path.parent))
     if free < disk_min_gb * 2**30:
         alerts.append(Alert("disk", "warn", f"磁盘只剩 {free / 2**30:.1f}GB"))

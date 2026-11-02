@@ -23,16 +23,25 @@ fi
 shift
 WITH_ENV=0
 COLLECT_ONLY=0
+FORCE=0
 CONFIG=configs/v2.toml
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --with-env) WITH_ENV=1 ;;
     --collect-only) COLLECT_ONLY=1 ;;
+    --force) FORCE=1 ;;
     --config) CONFIG="$2"; shift ;;
     *) echo "未知参数: $1" >&2; exit 1 ;;
   esac
   shift
 done
+
+# 模拟盘每天 00:00 UTC 决策：这段时间重启会丢掉当天的决策，默认拒绝
+now_utc=$(date -u +%H%M)
+if [[ ${FORCE} != 1 && ( 10#${now_utc} -ge 2345 || 10#${now_utc} -lt 30 ) ]]; then
+  echo "现在是 ${now_utc} UTC，正好在每日决策前后（23:45–00:30）。确实要继续请加 --force" >&2
+  exit 1
+fi
 
 cd "$(dirname "$0")/.."
 CTL="${HOME}/.ssh/mm-deploy-%C"

@@ -502,3 +502,159 @@ def test_execlab_marks_stale_fills(tmp_path, monkeypatch):
     old = int(__import__("time").time() * 1000) - STALE_MS - 60_000
     lab.place("ML_v2", "X-USDT-SWAP", "buy", 1.0, 10.0, old)
     assert lab.db.execute("SELECT status FROM shadow").fetchone()[0] == "stale" and not lab.open
+
+
+def test_save_parquet_is_atomic(tmp_path, monkeypatch):
+    import pandas as pd
+    import pytest as _pt
+
+    from moneymachine.ml.data import save_parquet
+
+    p = tmp_path / "x.parquet"
+    save_parquet(pd.DataFrame({"a": [1, 2]}), p)
+    real = pd.DataFrame.to_parquet
+
+    def half_write(self, path, **kw):
+        real(self, path, **kw)
+        with open(path, "r+b") as f:
+            f.truncate(4)                                     # what a crash mid-write leaves behind
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", half_write)
+    with _pt.raises(OSError):
+        save_parquet(pd.DataFrame({"a": [9]}), p)
+    monkeypatch.undo()
+    assert pd.read_parquet(p)["a"].tolist() == [1, 2]          # the old file is untouched
+    assert [f.name for f in tmp_path.iterdir()] == ["x.parquet"]  # no temp file left
+
+
+def test_sync_candles_keeps_the_old_file_if_a_write_dies(tmp_path, monkeypatch):
+    import pandas as pd
+    import pytest as _pt
+
+    from moneymachine.ml import data as Dmod
+
+    (tmp_path / "bars_1D").mkdir()
+    p = tmp_path / "bars_1D" / "X-USDT-SWAP.parquet"
+    now = int(__import__("time").time() * 1000)
+    day = 86_400_000
+    t0 = now - now % day - 5 * day
+    old = pd.DataFrame({"time": [t0], "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "vol_ccy": 1.0, "vol_quote": 1.0})
+    old.to_parquet(p, index=False)
+    monkeypatch.setattr(Dmod, "_fetch_candles", lambda *a, **k: old.assign(time=t0 + day))
+    real = pd.DataFrame.to_parquet
+
+    def half_write(self, path, **kw):
+        real(self, path, **kw)
+        with open(path, "r+b") as f:
+            f.truncate(4)
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", half_write)
+    with _pt.raises(OSError):
+        Dmod.sync_candles(None, "X-USDT-SWAP", "1Dutc", "bars_1D", root=tmp_path)
+    monkeypatch.undo()
+    assert pd.read_parquet(p)["time"].tolist() == [t0]        # the incident's call site cannot leave a torn file
+
+
+def _monitor_env(tmp_path):
+    from moneymachine.ledger import Ledger
+
+    lg = Ledger(tmp_path / "v2.sqlite", "r1")
+    lg.start_run("t", "paper", "")
+    lg.save_state(0, {"broker": {"accounts": {"ML_v2": {"balance": 1e5, "positions": {}, "fees_total": 0, "funding_total": 0},
+                                           "T1b_trend": {"balance": 1e3, "positions": {}, "fees_total": 0, "funding_total": 0}},
+                              "marks": {}, "last_bar_ts": {}}})
+    probe = {"state": lambda s: "active", "memory": lambda s: (0, 0), "disk_free": lambda p: 10 * 2**30}
+    return lg, probe
+
+
+def test_failed_delivery_is_retried_and_late_events_are_seen(tmp_path):
+    from moneymachine.monitor import DAY, run_once
+
+    lg, probe = _monitor_env(tmp_path)
+    now = 1_793_000_000_000 - 1_793_000_000_000 % DAY + 2 * 3_600_000    # 02:00 UTC
+    st = tmp_path / "m.json"
+    got, ok = [], {"v": False}
+
+    def sender(title, text):
+        got.append((title, text))
+        return ["email"] if ok["v"] else []
+
+    lg.event(now - 60_000, "error", "T1b_trend", "strategy_error", "boom")
+    lg.commit()
+    kw = dict(now_ms=now, probe=probe, sender=sender, summary_after_min=24 * 60)
+    run_once(tmp_path / "v2.sqlite", st, **{**kw})
+    assert any("boom" in t for _, t in got)                   # tried, failed
+    ok["v"] = True
+    got.clear()
+    run_once(tmp_path / "v2.sqlite", st, **{**kw, "now_ms": now + 300_000})
+    assert any("boom" in t for _, t in got)                   # the same event is sent again and now arrives
+    got.clear()
+    run_once(tmp_path / "v2.sqlite", st, **{**kw, "now_ms": now + 600_000})
+    assert not any("boom" in t for _, t in got)               # and only once after that
+    lg.event(now + 590_000, "error", None, "handler_error", "late commit")     # ts before the last run
+    lg.commit()
+    got.clear()
+    run_once(tmp_path / "v2.sqlite", st, **{**kw, "now_ms": now + 900_000})
+    assert any("late commit" in t for _, t in got)
+    lg.close()
+
+
+def test_missed_decision_is_not_reported_recovered_at_midnight(tmp_path):
+    import json
+
+    from moneymachine.monitor import DAY, run_once
+
+    lg, probe = _monitor_env(tmp_path)
+    midnight = 1_793_000_000_000 - 1_793_000_000_000 % DAY
+    st = tmp_path / "m.json"
+    st.write_text(json.dumps({"open": {"decision:T1b_trend": midnight / 1000 - 3600}, "last_run": midnight - 300_000}))
+    got = []
+    run_once(tmp_path / "v2.sqlite", st, now_ms=midnight + 300_000, probe=probe,
+             sender=lambda t, x: got.append(t), summary_after_min=24 * 60)
+    assert got == []                                          # 00:05: nothing is known about today yet
+    st.write_text("{broken")
+    run_once(tmp_path / "v2.sqlite", st, now_ms=midnight + 600_000, probe=probe,
+             sender=lambda t, x: got.append(t), summary_after_min=24 * 60)     # damaged state: still runs
+    assert json.loads(st.read_text())["last_run"] == midnight + 600_000
+    lg.close()
+
+
+def test_daily_summary_lists_today_per_arm(tmp_path):
+    import time as _t
+
+    from moneymachine.monitor import daily_summary
+
+    lg, _ = _monitor_env(tmp_path)
+    now = int(_t.time() * 1000)
+    lg.event(now - 2 * 86_400_000, "info", "ML_v2", "ml_targets", "old decision")
+    lg.event(now, "info", "T1b_trend", "ml_targets", "trend ok")
+    lg.commit()
+    text = daily_summary(tmp_path / "v2.sqlite")
+    assert "trend ok" in text and "old decision" not in text
+    assert "今日决策 机器学习策略：今日没有决策" in text
+    lg.close()
+
+
+def test_execlab_restart_keeps_what_an_open_row_saw(tmp_path, monkeypatch):
+    import pandas as pd
+
+    from moneymachine.execlab import ExecLab, _now
+    from moneymachine.ledger import Ledger
+
+    pd.DataFrame({"inst": ["X-USDT-SWAP"], "tick_sz": [0.01], "ct_val": [1.0]}).to_parquet(tmp_path / "i.parquet")
+    lg = Ledger(tmp_path / "l.sqlite", "r1")
+    lg.start_run("t", "paper", "")
+    lg.close()
+    args = (tmp_path / "l.sqlite", tmp_path / "x.sqlite", tmp_path / "i.parquet")
+    lab = ExecLab(*args)
+    monkeypatch.setattr(lab, "_mid", lambda s: (100.0, 100.1))
+    lab.place("ML_v2", "X-USDT-SWAP", "buy", 1.0, 100.2, _now())
+    (i, o), = lab.open.items()
+    lab.on_trade("X-USDT-SWAP", 99.9, 2, o["placed"] + 1)
+    lab.db.execute("UPDATE shadow SET mid30=50.0 WHERE id=?", (i,))
+    lab.db.commit()
+    again = ExecLab(*args)
+    assert again.open[i]["filled"] == o["placed"] + 1 and again.open[i]["mid30"] == 50.0
+    assert ("through" not in again.open[i]) and again.db.execute("SELECT filled_ts FROM shadow WHERE id=?", (i,)).fetchone()[0]

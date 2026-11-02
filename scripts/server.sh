@@ -28,6 +28,12 @@ case "${CMD}" in
     ssh -t "${HOST}" "journalctl -u ${SVC} -f -n 50 -o cat"
     ;;
   restart|stop|start)
+    # 模拟盘每天 00:00 UTC 决策：这段时间重启或停止会丢掉当天的决策
+    now_utc=$(date -u +%H%M)
+    if [[ ${CMD} != start && ${3:-} != --force && ( 10#${now_utc} -ge 2345 || 10#${now_utc} -lt 30 ) ]]; then
+      echo "现在是 ${now_utc} UTC，正好在每日决策前后（23:45–00:30）。确实要继续请在命令最后加 --force" >&2
+      exit 1
+    fi
     ssh "${HOST}" "systemctl ${CMD} ${SVC} && systemctl --no-pager --lines=0 status ${SVC} | head -4"
     ;;
   check)

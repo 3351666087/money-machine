@@ -35,6 +35,7 @@ import httpx
 log = logging.getLogger(__name__)
 DAY = 86_400_000
 RESEND_AFTER_S = 6 * 3600
+EVENT_LOOKBACK_MS = 10 * 60_000
 NAMES = {"ML_v2": "机器学习策略", "S0_hold_btc": "买入持有BTC", "P0_placebo": "随机对照组",
          "A1a_smoothed": "探索组·信号平滑", "P2_placebo_smoothed": "随机对照·平滑",
          "B1b_concentrated": "探索组·小资金集中", "P1_placebo_concentrated": "随机对照·小资金集中",
@@ -164,9 +165,12 @@ def daily_summary(db_path: Path) -> str:
         start = first[0] if first and first[0] else eq
         lines.append(f"{NAMES.get(sid, sid)}：{eq:,.0f}（{eq / start - 1:+.2%}），持仓 {len(a['positions'])} 个，"
                      f"手续费 {a['fees_total']:,.1f}，资金费 {a['funding_total']:+,.1f}")
-    for ts, s, msg in db.execute("SELECT ts, strategy, message FROM events WHERE run_id=? AND kind='ml_targets' "
-                                 "ORDER BY ts DESC LIMIT 6", (run_id,)):
-        lines.append(f"今日决策 {NAMES.get(s, s)}：{msg}")
+    today = int(time.time() * 1000) // DAY * DAY
+    decided = dict(db.execute("SELECT strategy, message FROM events WHERE run_id=? AND kind='ml_targets' AND ts>=? "
+                              "ORDER BY ts", (run_id, today)))
+    for s in PORTFOLIO_IDS:
+        if s in st["accounts"]:
+            lines.append(f"今日决策 {NAMES.get(s, s)}：{decided.get(s, '今日没有决策')}")
     db.close()
     okx = okx_line()
     if okx:
@@ -216,7 +220,9 @@ def _email(title: str, text: str) -> None:
         s.send_message(msg)
 
 
-def send(title: str, text: str) -> list[str]:
+def send(title: str, text: str) -> list[str] | None:
+    """Channels that delivered: [] = every configured channel failed (run_once retries);
+    None = nothing configured (journal only, nothing to retry)."""
     body = f"{title}\n{text}"
     channels = []
     if url := os.environ.get("MM_ALERT_FEISHU_WEBHOOK"):
@@ -239,38 +245,79 @@ def send(title: str, text: str) -> list[str]:
             log.warning("alert delivery via %s failed: %s", name, e if isinstance(e, RuntimeError)
                         else type(e).__name__)
     log.info("[%s] %s\n%s", ",".join(sent) or "journal-only", title, text)
-    return sent
+    return sent if channels else None
 
 
 def run_once(db_path: Path, state_path: Path, *, collect_dir: Path | None = None, summary_after_min: int = 40,
              now_ms: int | None = None, probe=None, sender=send) -> dict:
     now_ms = now_ms or int(time.time() * 1000)
-    state = json.loads(state_path.read_text()) if state_path.exists() else {"open": {}, "last_run": now_ms - 600_000}
-    alerts = check(db_path, now_ms=now_ms, since_ms=state.get("last_run", now_ms - 600_000),
+    state = _load_state(state_path, now_ms)
+    # look back: event rows carry their own ts but become visible only when the ledger commits, up to
+    # minutes later. Re-reading is harmless, event keys stay in "open" while they are in the window.
+    alerts = check(db_path, now_ms=now_ms, since_ms=state.get("last_run", now_ms - 600_000) - EVENT_LOOKBACK_MS,
                    collect_dir=collect_dir, probe=probe, open_keys=tuple(state["open"]))
     if probe is None and now_ms - state.get("okx_checked", 0) > 3_600_000:   # real account: hourly, read-only
         state["okx_checked"] = now_ms
         line = okx_line()
         state["okx_alert"] = line if line and ("查询失败" in line or "read_only" not in line) else None
+        state["delisted"] = delisted_candidates()
     if state.get("okx_alert"):
         alerts.append(Alert("okx:api", "warn", state["okx_alert"]))
+    if state.get("delisted"):
+        alerts.append(Alert("candidates:delisted", "crit", f"候选币已下架：{', '.join(state['delisted'][:8])}。"
+                            "模拟盘下次重启会启动失败，重启前要先处理"))
     current = {a.key: a for a in alerts}
     fresh = [a for a in alerts if a.key not in state["open"] or now_ms / 1000 - state["open"][a.key] > RESEND_AFTER_S]
-    recovered = [k for k in state["open"] if k not in current and not k.startswith("event:")]
+    # the decision check only starts at 00:30: before that a missed decision is not "recovered", just old
+    recovered = [k for k in state["open"] if k not in current and not k.startswith("event:")
+                 and not (k.startswith("decision:") and now_ms % DAY <= 30 * 60_000)]
+    alerts_ok = recovery_ok = True          # [] from the sender = delivery failed: retry on the next run
     if fresh:
         crit = any(a.level == "crit" for a in fresh)
-        sender("【刷钱机告警】" if crit else "【刷钱机提醒】", "\n".join(f"- {a.message}" for a in fresh))
+        alerts_ok = sender("【刷钱机告警】" if crit else "【刷钱机提醒】",
+                           "\n".join(f"- {a.message}" for a in fresh)) != []
     if recovered:
-        sender("【刷钱机恢复】", "\n".join(f"- 已恢复：{k}" for k in recovered))
-    open_ = {k: v for k, v in state["open"].items() if k in current}
-    open_.update({a.key: now_ms / 1000 for a in fresh})
+        recovery_ok = sender("【刷钱机恢复】", "\n".join(f"- 已恢复：{k}" for k in recovered)) != []
+    open_ = {k: v for k, v in state["open"].items()
+             if k in current or (k in recovered and not recovery_ok)
+             or (k.startswith("decision:") and now_ms % DAY <= 30 * 60_000)}
+    if alerts_ok:
+        open_.update({a.key: now_ms / 1000 for a in fresh})
     day = time.strftime("%Y-%m-%d", time.gmtime(now_ms / 1000))
     if now_ms % DAY > summary_after_min * 60_000 and state.get("summary_day") != day:
         try:
-            sender("【刷钱机日报】", daily_summary(db_path))
-            state["summary_day"] = day
+            if sender("【刷钱机日报】", daily_summary(db_path)) != []:
+                state["summary_day"] = day
         except Exception as e:  # noqa: BLE001
             log.warning("daily summary failed: %s", e)
-    state.update(open=open_, last_run=now_ms)
-    state_path.write_text(json.dumps(state))
+    state.update(open=open_, last_run=now_ms if alerts_ok else state.get("last_run", now_ms))
+    tmp = state_path.with_name(state_path.name + ".tmp")
+    tmp.write_text(json.dumps(state))
+    os.replace(tmp, state_path)
     return {"alerts": len(alerts), "sent": len(fresh), "recovered": len(recovered)}
+
+
+def _load_state(path: Path, now_ms: int) -> dict:
+    empty = {"open": {}, "last_run": now_ms - 600_000}
+    if not path.exists():
+        return empty
+    try:
+        return json.loads(path.read_text())
+    except ValueError:      # a damaged state file must not stop the monitor for good
+        log.warning("monitor state unreadable, starting afresh")
+        return empty
+
+
+def delisted_candidates(path: Path = Path("store/ml/candidates.txt")) -> list[str]:
+    """Candidates OKX no longer lists: the paper process refuses to start with those in its symbol list."""
+    if not path.exists():
+        return []
+    try:
+        from moneymachine.market.okx_rest import OkxRest
+
+        listed = {d["instId"] for d in OkxRest().get("/api/v5/public/instruments", {"instType": "SWAP"})}
+    except Exception as e:  # noqa: BLE001
+        log.warning("instrument list unavailable: %s", e)
+        return []
+    wanted = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+    return [c for c in wanted if listed and c not in listed]

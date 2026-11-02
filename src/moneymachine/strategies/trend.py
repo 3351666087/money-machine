@@ -20,6 +20,8 @@ class TrendTSMOM(Strategy):
             return None
         from moneymachine.ml.trend import live_targets
 
+        # runs beside the ML arms, which rewrite the same daily-bar files: data.save_parquet makes that
+        # safe. Deliberately no _DECISION_LOCK, it would tie this arm to their Kronos runs and timeouts.
         targets, info = live_targets(self.symbols, ctx.now, ctx.weights(),
                                      long_only=bool(self.params.get("long_only", True)),
                                      sync=bool(self.params.get("sync", True)))

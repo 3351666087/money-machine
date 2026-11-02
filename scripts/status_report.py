@@ -10,19 +10,20 @@ db = sqlite3.connect("file:runs/v2.sqlite?mode=ro", uri=True)
 run = db.execute("SELECT run_id FROM runs WHERE mode=? ORDER BY created_at DESC LIMIT 1", ("paper",)).fetchone()[0]
 now = int(time.time() * 1000)
 today = now // DAY * DAY
+DAYS = 13                  # how far back the health sections look
 
-print("== decisions per day (last 6 UTC days): ok / skipped / errors")
+print(f"== decisions per day (last {DAYS} UTC days): ok / skipped / errors")
 per = defaultdict(lambda: defaultdict(lambda: [0, 0, 0]))
 for ts, s, kind in db.execute("SELECT ts, strategy, kind FROM events WHERE run_id=? AND ts>=? AND kind IN (?,?,?,?)",
-                              (run, today - 5 * DAY, "ml_targets", "ml_skip", "strategy_error", "handler_error")):
+                              (run, today - (DAYS - 1) * DAY, "ml_targets", "ml_skip", "strategy_error", "handler_error")):
     i = {"ml_targets": 0, "ml_skip": 1}.get(kind, 2)
     per[time.strftime("%m-%d", time.gmtime(ts / 1000))][s][i] += 1
 for d in sorted(per):
     print(f"  {d}: " + "  ".join(f"{s or '(engine)'}={v[0]}/{v[1]}/{v[2]}"
                                  for s, v in sorted(per[d].items(), key=lambda kv: str(kv[0]))))
 errs = db.execute("SELECT ts, strategy, kind, message FROM events WHERE run_id=? AND ts>=? AND level=? ORDER BY ts DESC "
-                  "LIMIT 5", (run, today - 5 * DAY, "error")).fetchall()
-print("== error events (last 6 days):", len(errs))
+                  "LIMIT 20", (run, today - (DAYS - 1) * DAY, "error")).fetchall()
+print(f"== error events (last {DAYS} days):", len(errs))
 for ts, s, kind, msg in errs:
     print(f"  {time.strftime('%m-%d %H:%M', time.gmtime(ts / 1000))} {s} {kind}: {msg[:120]}")
 

@@ -14,6 +14,8 @@ the history is survivorship-biased; reports state this explicitly.
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -30,6 +32,18 @@ START_MS = 1_577_836_800_000  # 2020-01-01
 RUBIK_START_MS = 1_703_980_800_000  # 2023-12-31 (OKX keeps no earlier daily OI)
 BAR_COLS = ["time", "open", "high", "low", "close", "vol_ccy", "vol_quote"]
 _TF_MS = {"1Dutc": 86_400_000, "4H": 4 * 3_600_000, "1H": 3_600_000, "1m": 60_000}
+
+
+def save_parquet(df: pd.DataFrame, path: Path) -> None:
+    """Atomic: readers see the old file or the new one, never a half-written file. The paper
+    process reads and writes these from several threads at decision time (2026-10-31 and 11-02:
+    the trend account read a daily-bar file mid-write and missed its decision)."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        df.to_parquet(tmp, index=False)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _path(kind: str, name: str, root: Path = ROOT) -> Path:
@@ -49,7 +63,7 @@ def crypto_instruments(rest: OkxRest, root: Path = ROOT) -> pd.DataFrame:
             })
     df = pd.DataFrame(rows).sort_values("list_ts").reset_index(drop=True)
     root.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(root / "instruments.parquet", index=False)
+    save_parquet(df, root / "instruments.parquet")
     return df
 
 
@@ -90,7 +104,7 @@ def sync_candles(rest: OkxRest, inst: str, bar: str, kind: str, *, start: int = 
     if len(new):
         df = pd.concat([old, new], ignore_index=True) if len(old) else new
         df = df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
-        df.to_parquet(p, index=False)
+        save_parquet(df, p)
     return len(new)
 
 
@@ -116,7 +130,7 @@ def sync_funding(rest: OkxRest, inst: str, *, start: int = START_MS, root: Path 
         except Exception as e:  # noqa: BLE001
             log.warning("funding archive %s: %s", inst, e)
     if have:
-        pd.DataFrame(sorted(have.items()), columns=["time", "rate"]).to_parquet(p, index=False)
+        save_parquet(pd.DataFrame(sorted(have.items()), columns=["time", "rate"]), p)
     return len(have)
 
 
@@ -152,7 +166,7 @@ def sync_rubik(rest: OkxRest, inst: str, kind: str, *, root: Path = ROOT) -> int
     new = pd.DataFrame([got[k] for k in sorted(got)], columns=cols)
     if len(new):
         df = pd.concat([old, new], ignore_index=True) if len(old) else new
-        df.drop_duplicates("time", keep="last").sort_values("time").to_parquet(p, index=False)
+        save_parquet(df.drop_duplicates("time", keep="last").sort_values("time"), p)
     return len(new)
 
 

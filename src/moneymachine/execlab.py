@@ -67,14 +67,18 @@ class ExecLab:
         self.last_seen = self.db.execute("SELECT COALESCE(MAX(taker_ts), 0) FROM shadow").fetchone()[0] or \
             _now() - 10 * 60_000
         self.open: dict[int, dict] = {}
-        for row in self.db.execute("SELECT id, symbol, side, limit_px, tick, placed_ts FROM shadow "
-                                   "WHERE status='open'"):
-            i, sym, side, lim, tick, placed = row
+        rows = self.db.execute("SELECT id, symbol, side, limit_px, tick, placed_ts, filled_ts, mid30 FROM shadow "
+                               "WHERE status='open'").fetchall()
+        for i, sym, side, lim, tick, placed, filled, mid30 in rows:
             if _now() - placed > WINDOW_MS:
-                self._close(i, "expired_during_downtime")
+                self._close(i, "filled" if filled else "expired_during_downtime")
             else:
                 self.open[i] = {"symbol": sym, "side": side, "limit": lim, "tick": tick, "placed": placed,
                                 "note": "restarted: trades during downtime unseen"}
+                if filled:                         # keep what this row already saw before the restart
+                    self.open[i]["filled"] = filled
+                if mid30 is not None:
+                    self.open[i]["mid30"] = mid30
         self.subscribed: set[str] = set()
 
     # ── new paper fills → virtual post-only orders ─────────────────────────

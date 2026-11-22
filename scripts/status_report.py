@@ -10,7 +10,7 @@ db = sqlite3.connect("file:runs/v2.sqlite?mode=ro", uri=True)
 run = db.execute("SELECT run_id FROM runs WHERE mode=? ORDER BY created_at DESC LIMIT 1", ("paper",)).fetchone()[0]
 now = int(time.time() * 1000)
 today = now // DAY * DAY
-DAYS = 13                  # how far back the health sections look
+DAYS = 21                  # how far back the health sections look
 
 print(f"== decisions per day (last {DAYS} UTC days): ok / skipped / errors")
 per = defaultdict(lambda: defaultdict(lambda: [0, 0, 0]))

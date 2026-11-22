@@ -19,6 +19,7 @@ Channels (set in the server's .env; none set → journal only):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -131,7 +132,11 @@ def check(db_path: Path, *, now_ms: int, since_ms: int,
             "SELECT ts, strategy, kind, message FROM events WHERE run_id=? AND ts>? AND (level='error' OR kind "
             "IN ('liquidation','risk_halt','ml_skip')) ORDER BY ts", (run_id, since_ms)):
         lvl = "crit" if kind in ("liquidation", "strategy_error", "handler_error") else "warn"
-        alerts.append(Alert(f"event:{kind}:{s}:{ts}", lvl, f"{NAMES.get(s, s or '-')} {kind}: {msg[:200]}"))
+        # key on the message, not ts: a recurring error (e.g. polling a delisted instrument every few
+        # minutes) is one problem — alert once, remind every 6h — not a fresh alert on every run.
+        # Distinct events (different messages) still alert individually.
+        digest = hashlib.sha1(msg.encode()).hexdigest()[:12]
+        alerts.append(Alert(f"event:{kind}:{s}:{digest}", lvl, f"{NAMES.get(s, s or '-')} {kind}: {msg[:200]}"))
 
     for s, in db.execute("SELECT DISTINCT strategy FROM equity WHERE run_id=?", (run_id,)):
         eq = [e for (e,) in db.execute("SELECT equity FROM equity WHERE run_id=? AND strategy=? ORDER BY ts",
@@ -267,7 +272,7 @@ def run_once(db_path: Path, state_path: Path, *, collect_dir: Path | None = None
         alerts.append(Alert("candidates:delisted", "crit", f"候选币已下架：{', '.join(state['delisted'][:8])}。"
                             "模拟盘下次重启会启动失败，重启前要先处理"))
     current = {a.key: a for a in alerts}
-    fresh = [a for a in alerts if a.key not in state["open"] or now_ms / 1000 - state["open"][a.key] > RESEND_AFTER_S]
+    fresh = [a for a in current.values() if a.key not in state["open"] or now_ms / 1000 - state["open"][a.key] > RESEND_AFTER_S]
     # the decision check only starts at 00:30: before that a missed decision is not "recovered", just old
     recovered = [k for k in state["open"] if k not in current and not k.startswith("event:")
                  and not (k.startswith("decision:") and now_ms % DAY <= 30 * 60_000)]

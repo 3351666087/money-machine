@@ -601,6 +601,28 @@ def test_failed_delivery_is_retried_and_late_events_are_seen(tmp_path):
     lg.close()
 
 
+def test_recurring_identical_events_alert_once(tmp_path):
+    from moneymachine.monitor import DAY, run_once
+
+    lg, probe = _monitor_env(tmp_path)
+    now = 1_793_000_000_000 - 1_793_000_000_000 % DAY + 2 * 3_600_000    # 02:00 UTC
+    st = tmp_path / "m.json"
+    got = []
+    kw = dict(probe=probe, sender=lambda t, x: got.append((t, x)), summary_after_min=24 * 60)
+    lg.event(now - 120_000, "error", None, "handler_error", "OkxError: code=51001")   # two identical in one window
+    for i in range(4):                                   # same error every 5 min, like a delisted-symbol poll
+        lg.event(now + i * 300_000 - 60_000, "error", None, "handler_error", "OkxError: code=51001")
+        lg.commit()
+        run_once(tmp_path / "v2.sqlite", st, now_ms=now + i * 300_000, **kw)
+    assert sum(x.count("51001") for _, x in got) == 1  # one line total: dedup within a batch and across runs
+    lg.event(now + 4 * 300_000 - 60_000, "error", None, "handler_error", "something else")
+    lg.commit()
+    got.clear()
+    run_once(tmp_path / "v2.sqlite", st, now_ms=now + 4 * 300_000, **kw)
+    assert any("something else" in x for _, x in got)    # a different error still alerts
+    lg.close()
+
+
 def test_missed_decision_is_not_reported_recovered_at_midnight(tmp_path):
     import json
 
